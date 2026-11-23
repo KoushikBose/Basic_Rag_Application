@@ -5,35 +5,32 @@ from dotenv import load_dotenv
 load_dotenv()  # load HF_TOKEN / GROQ_API_KEY from .env
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import os
-import glob
+import logging
 import pandas as pd
+
+from config import KNOWLEDGE_BASE_DIR, CHUNK_SIZE, CHUNK_OVERLAP, EMBEDDING_MODEL_NAME
+from ingest import sync_vector_store
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
 
 # 🔵 1. Re-initialize Retriever
-# 🟢 Load every PDF from the "knowledge base" folder (one level above /backend)
-# 🟢 instead of the old /content/langchain_rag_dataset.txt file
-
-KNOWLEDGE_BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "knowledge base")
-raw_doc = []
-for pdf_path in glob.glob(os.path.join(KNOWLEDGE_BASE_DIR, "*.pdf")):
-    raw_doc.extend(PyPDFLoader(pdf_path).load())
+# 🟢 Every PDF in the "knowledge base" folder (one level above /backend) is indexed
 
 # ✂️🌈 Slice those big PDF pages into bite-sized, overlapping chunks —
 # 🧩 each piece shares a little context with its neighbours, so the retriever
 # 🔍 never loses the thread when hunting for the perfect answer!
 
-splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
-chunks = splitter.split_documents(raw_doc)
+splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
-# 🟣 Create embeddings, build the FAISS vector store and expose it as a similarity retriever
+# 🟣 Create embeddings and the FAISS vector store, then expose it as a similarity retriever
+# ⚡ Incremental: the index is saved to disk and only NEW / CHANGED PDFs are
+# ⚡ loaded, split and embedded. Removed PDFs are dropped. See ingest.py.
 
-embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-vector_store = FAISS.from_documents(chunks, embedding_model)
+embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+vector_store = sync_vector_store(KNOWLEDGE_BASE_DIR, splitter, embedding_model)
 retriever = vector_store.as_retriever( search_type="similarity",search_kwargs={"k":3})
 
 # 🟠 2. Re-initialize LLM with Chat Wrapper

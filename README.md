@@ -22,11 +22,13 @@ flowchart LR
         PARSE["StrOutputParser"]
     end
 
-    subgraph Index["Indexing (runs once at startup)"]
-        PDFS["knowledge base/*.pdf"] --> LOAD["PyPDFLoader"]
+    subgraph Index["Incremental indexing (ingest.py, at startup or on a schedule)"]
+        PDFS["knowledge base/*.pdf"] --> DIFF{"changed?<br/>size+mtime, then sha256<br/>vs manifest.sqlite3"}
+        DIFF -- "new / modified only" --> LOAD["PyPDFLoader"]
         LOAD --> SPLIT["RecursiveCharacterTextSplitter<br/>300 chars, 50 overlap"]
-        SPLIT --> EMB["HuggingFaceEmbeddings<br/>all-MiniLM-L6-v2"]
-        EMB --> VS[("FAISS vector store<br/>in memory")]
+        SPLIT --> EMB["HuggingFaceEmbeddings<br/>all-MiniLM-L6-v2 (batched)"]
+        EMB --> VS[("FAISS vector store<br/>persisted in vector_store/")]
+        DIFF -- "removed / modified" --> DEL["delete old chunk ids"] --> VS
     end
 
     UI -- "question (JSON)" --> API
@@ -41,7 +43,7 @@ flowchart LR
 
 ### Request flow
 
-1. **Indexing (startup).** Importing `backend.py` loads every PDF in `knowledge base/` and splits it into 300-character chunks with 50 characters of overlap. Each chunk is embedded with `all-MiniLM-L6-v2` and stored in an in-memory FAISS index. The index is rebuilt on every start and is not saved to disk.
+1. **Indexing (startup, incremental).** Importing `backend.py` calls `sync_vector_store()` in `ingest.py`. It loads the FAISS index saved in `vector_store/` and compares `knowledge base/*.pdf` with a SQLite manifest. Only new or changed PDFs are split into 300-character chunks with 50 characters of overlap and embedded with `all-MiniLM-L6-v2`. Chunks of removed PDFs are deleted. Unchanged PDFs are not even read. The index is then saved back to disk atomically. If the embedding model or chunk settings change, the index is rebuilt automatically.
 2. **Question.** The browser sends `POST /api/ask` with `{ "question": "..." }`.
 3. **Retrieval.** The retriever returns the 3 chunks most similar to the question.
 4. **Generation.** The chunks are inserted into a prompt that tells the LLM to answer only from the context. If the answer isn't in the context, the LLM replies: *"I don't know, it's not in my knowledge base."* The prompt goes to Groq's `openai/gpt-oss-120b`, with `max_tokens=500`.
@@ -52,13 +54,16 @@ flowchart LR
 ```
 Basic Rag Project/
 ├── backend/
-│   ├── backend.py        # RAG pipeline: load -> chunk -> embed -> FAISS -> prompt -> LLM
+│   ├── backend.py        # RAG pipeline: index -> retriever -> prompt -> LLM
+│   ├── ingest.py         # Incremental indexing (also a CLI: python ingest.py [--rebuild])
+│   ├── config.py         # Paths, chunking/embedding settings, batch sizes
 │   └── server.py         # Flask app: /api/ask endpoint + static frontend hosting
 ├── frontend/
 │   ├── index.html        # Chat page
 │   ├── script.js         # Calls /api/ask, renders answer and sources
 │   └── style.css
 ├── knowledge base/       # PDFs that are indexed (add your own here)
+├── vector_store/         # Persisted FAISS index + manifest (generated, not committed)
 ├── requirements.txt
 ├── .env                  # API keys (not committed)
 └── README.md
@@ -136,7 +141,9 @@ An empty question returns `400`. A pipeline error returns `500`. Both have the f
 
 ## Customizing
 
-- **Add knowledge:** drop more PDFs into `knowledge base/` and restart the server.
+- **Add knowledge:** drop more PDFs into `knowledge base/` and restart the server. Only the new files are embedded. You can also run `python ingest.py` (e.g. from a scheduler) to index ahead of time; the next server start then has nothing to embed.
+- **Full rebuild:** `python ingest.py --rebuild`.
 - **Retrieval depth:** change `k` in `search_kwargs` in `backend.py`.
-- **Chunking:** change `chunk_size` and `chunk_overlap` in `backend.py`.
+- **Chunking / embedding model:** change `CHUNK_SIZE`, `CHUNK_OVERLAP` or `EMBEDDING_MODEL_NAME` in `config.py`. The index rebuilds itself on the next start.
+- **Indexing knobs (env vars):** `VECTOR_STORE_DIR` (where the index lives; a local disk outside OneDrive is best), `EMBED_BATCH_SIZE` (chunks per embedding call, default 512) and `CHECKPOINT_EVERY` (chunks between saves, default 50000).
 - **Model:** change the model name passed to `ChatGroq`.
